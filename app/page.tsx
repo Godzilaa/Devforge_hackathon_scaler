@@ -155,6 +155,8 @@ export default function IDEPage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isFixing, setIsFixing] = useState(false);
   const [showLogger, setShowLogger] = useState(false);
+  const [pendingPatch, setPendingPatch] = useState<any>(null);
+  const [showPatchDialog, setShowPatchDialog] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
   
   useEffect(() => {
@@ -368,7 +370,7 @@ export default function IDEPage() {
   };
 
   const fixCode = async () => {
-    const activeTabData = tabs.find(tab => tab.id === activeTab);
+    const activeTabData = tabs.find((tab: Tab) => tab.id === activeTab);
     if (!activeTabData) {
       addLog('error', '❌ No file open to fix', {});
       return;
@@ -407,8 +409,10 @@ export default function IDEPage() {
 
       const decoder = new TextDecoder();
       let buffer = '';
+      let lastPatchCode: string | null = null;
+      let shouldContinue = true;
 
-      while (true) {
+      while (shouldContinue) {
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -430,6 +434,29 @@ export default function IDEPage() {
                 explanation: event.data.fix_explanation,
                 confidence: event.data.confidence
               });
+
+              // Store patch and show confirmation dialog
+              setPendingPatch({
+                index: event.index,
+                data: event.data,
+                explanation: event.data.fix_explanation
+              });
+              setShowPatchDialog(true);
+
+              // Pause the stream reading until user confirms
+              shouldContinue = false;
+              
+              // Wait for user decision
+              await new Promise((resolve) => {
+                const checkUserDecision = setInterval(() => {
+                  if (!showPatchDialog) {
+                    clearInterval(checkUserDecision);
+                    resolve(null);
+                  }
+                }, 100);
+              });
+
+              shouldContinue = true;
             } else if (event.event === 'complete') {
               addLog('success', `✅ Fixing complete!`, { session_id: event.session_id });
 
@@ -438,9 +465,11 @@ export default function IDEPage() {
 
               addToTerminal(`\n✨ AI Fixed code! Applied fixes and updated editor.`);
               setIsFixing(false);
+              shouldContinue = false;
             } else if (event.event === 'error') {
               addLog('error', `❌ ${event.message}`, {});
               setIsFixing(false);
+              shouldContinue = false;
             }
           } catch (e) {
             console.error('Failed to parse event:', line, e);
@@ -451,6 +480,19 @@ export default function IDEPage() {
       addLog('error', `❌ Network error: ${error instanceof Error ? error.message : String(error)}`, {});
       setIsFixing(false);
     }
+  };
+
+  const approvePatch = () => {
+    addLog('success', `✅ Patch approved and applied!`, {});
+    setShowPatchDialog(false);
+    setPendingPatch(null);
+  };
+
+  const rejectPatch = () => {
+    addLog('warning', `⏭️ Patch skipped by user`, {});
+    setShowPatchDialog(false);
+    setPendingPatch(null);
+    setIsFixing(false);
   };
   
   const renderFileTree = (items: FileItem[], depth = 0) => {
@@ -489,6 +531,57 @@ export default function IDEPage() {
 
   return (
     <div className="h-screen flex flex-col bg-[#1e1e1e] text-white">
+      {/* Patch Confirmation Dialog */}
+      {showPatchDialog && pendingPatch && (
+        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50">
+          <div className="bg-[#2d2d30] p-8 rounded-lg shadow-2xl w-96 max-h-96 flex flex-col">
+            <div className="flex items-center mb-4">
+              <Wand2 className="w-5 h-5 mr-2 text-purple-400" />
+              <h3 className="text-lg font-semibold">Review Patch #{pendingPatch.index + 1}</h3>
+            </div>
+
+            <div className="flex-1 overflow-auto mb-4">
+              <div className="bg-[#1e1e1e] p-3 rounded text-sm">
+                <p className="text-gray-300 mb-2">
+                  <strong>Explanation:</strong>
+                </p>
+                <p className="text-gray-200 mb-3">
+                  {pendingPatch.explanation}
+                </p>
+                
+                <p className="text-gray-300 mb-2">
+                  <strong>Confidence:</strong>
+                </p>
+                <div className="w-full bg-gray-700 rounded h-2 mb-3">
+                  <div
+                    className="bg-green-500 h-2 rounded transition-all"
+                    style={{ width: `${(pendingPatch.data.confidence || 0) * 100}%` }}
+                  />
+                </div>
+                <p className="text-xs text-gray-400">
+                  {Math.round((pendingPatch.data.confidence || 0) * 100)}% confidence
+                </p>
+              </div>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={rejectPatch}
+                className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 rounded font-medium transition-colors"
+              >
+                ❌ Skip
+              </button>
+              <button
+                onClick={approvePatch}
+                className="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 rounded font-medium transition-colors"
+              >
+                ✅ Apply
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* New File Dialog */}
       {showNewFileDialog && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
