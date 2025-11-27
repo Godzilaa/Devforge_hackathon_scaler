@@ -92,6 +92,19 @@ class ApplyPatchResponse(BaseModel):
     message: str
     updated_code: str
 
+class LogEvent(BaseModel):
+    """Represents a log entry from the AI fixing process"""
+    timestamp: str
+    level: str  # "info", "success", "warning", "error"
+    message: str
+    details: Optional[Dict[str, Any]] = None
+
+class ContinuousFixRequest(BaseModel):
+    code: str
+    language: str
+    file_path: str = "main"
+    max_iterations: int = 5  # Max number of fix attempts
+
 # =============================================================================
 # In-memory storage (replace with Redis/DB for production)
 # =============================================================================
@@ -650,6 +663,98 @@ Respond in 1-2 sentences."""
 ai_fixer = AICodeFixer(ollama)
 
 # =============================================================================
+# Continuous Fixing Logic
+# =============================================================================
+
+class ContinuousCodeFixer:
+    """Iteratively fixes code by applying patches and re-checking for errors"""
+    
+    async def fix_continuously(
+        self,
+        code: str,
+        language: str,
+        file_path: str,
+        max_iterations: int = 5
+    ) -> tuple[str, List[LogEvent], List[FilePatch]]:
+        """Continuously fix code up to max_iterations times"""
+        
+        logs: List[LogEvent] = []
+        all_patches: List[FilePatch] = []
+        current_code = code
+        iteration = 0
+        
+        def add_log(level: str, message: str, details: Optional[Dict[str, Any]] = None):
+            logs.append(LogEvent(
+                timestamp=datetime.now().isoformat(),
+                level=level,
+                message=message,
+                details=details
+            ))
+        
+        add_log("info", f"Starting continuous fix process (max {max_iterations} iterations)", {"language": language, "file_path": file_path})
+        
+        while iteration < max_iterations:
+            iteration += 1
+            add_log("info", f"Iteration {iteration}/{max_iterations}: Executing code...")
+            
+            # Execute current code
+            exec_result = await sandbox.execute_code(current_code, language, file_path)
+            
+            add_log(
+                "info" if exec_result.success else "warning",
+                f"Code execution {'succeeded' if exec_result.success else 'failed'}",
+                {"exit_code": exec_result.exit_code, "execution_time": exec_result.execution_time}
+            )
+            
+            # If execution succeeded, we're done
+            if exec_result.success:
+                add_log("success", "✅ Code is now fixed! All iterations passed.", {})
+                return current_code, logs, all_patches
+            
+            # Parse errors
+            errors = analyzer.parse_errors(exec_result.stderr, language)
+            add_log("warning", f"Found {len(errors)} error(s)", {"errors": [e.dict() for e in errors]})
+            
+            # Check if errors are auto-fixable
+            fixable_errors = [e for e in errors if e.error_category == ErrorCategory.AUTO_FIXABLE]
+            
+            if not fixable_errors:
+                add_log("error", "⚠️ Remaining errors require manual intervention", {"stderr": exec_result.stderr})
+                return current_code, logs, all_patches
+            
+            # Generate patches for fixable errors
+            patches = []
+            for error in fixable_errors:
+                add_log("info", f"Generating fix for {error.error_type}...", {"line": error.line_number})
+                patch = await ai_fixer._generate_patch(current_code, error, language)
+                
+                if patch:
+                    patches.append(patch)
+                    all_patches.append(patch)
+                    add_log(
+                        "success",
+                        f"✨ Generated patch: {patch.fix_explanation}",
+                        {"confidence": patch.confidence}
+                    )
+                else:
+                    add_log("error", f"Failed to generate patch for {error.error_type}", {})
+            
+            # Apply patches
+            if patches:
+                add_log("info", f"Applying {len(patches)} patch(es)...", {})
+                # Apply the first patch (or merge if multiple)
+                current_code = patches[0].patched_content
+                add_log("success", "Patches applied. Retrying execution...", {})
+            else:
+                add_log("error", "No patches could be generated. Stopping.", {})
+                return current_code, logs, all_patches
+        
+        add_log("warning", f"Reached maximum iterations ({max_iterations}). Stopping.", {})
+        return current_code, logs, all_patches
+
+continuous_fixer = ContinuousCodeFixer()
+
+# =============================================================================
 # API Endpoints
 # =============================================================================
 
@@ -800,7 +905,56 @@ async def analyze_code_stream(request: AnalysisRequest):
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
-@app.post("/api/apply-patch", response_model=ApplyPatchResponse)
+@app.post("/api/fix-continuously")
+async def fix_code_continuously(request: ContinuousFixRequest):
+    """
+    Continuously fix code using AI:
+    1. Execute the code
+    2. If errors exist, generate patches using LLM
+    3. Apply patches and re-execute
+    4. Repeat until code passes or max iterations reached
+    Returns streamed log events showing the entire fixing process.
+    """
+    
+    async def event_stream():
+        yield (json.dumps({"event": "started", "timestamp": datetime.utcnow().isoformat()}) + "\n")
+        
+        # Check Ollama connection
+        if not await ollama.check_connection():
+            yield (json.dumps({"event": "error", "message": "Ollama is not running"}) + "\n")
+            return
+        
+        # Run continuous fixer
+        fixed_code, logs, patches = await continuous_fixer.fix_continuously(
+            request.code,
+            request.language,
+            request.file_path,
+            request.max_iterations
+        )
+        
+        # Stream each log event
+        for log in logs:
+            yield (json.dumps({"event": "log", "data": log.dict()}) + "\n")
+        
+        # Stream patches
+        for i, patch in enumerate(patches):
+            yield (json.dumps({"event": "patch", "index": i, "data": patch.dict()}) + "\n")
+        
+        # Create session for later reference
+        session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        sessions[session_id] = {
+            "code": request.code,
+            "language": request.language,
+            "file_path": request.file_path,
+            "fixed_code": fixed_code,
+            "logs": [log.dict() for log in logs],
+            "patches": [patch.dict() for patch in patches],
+            "created_at": datetime.now().isoformat()
+        }
+        
+        yield (json.dumps({"event": "complete", "session_id": session_id, "fixed_code": fixed_code, "total_logs": len(logs)}) + "\n")
+    
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 async def apply_patch(request: ApplyPatchRequest):
     """Apply a specific patch to the code"""
     

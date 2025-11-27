@@ -1,7 +1,7 @@
 'use client';
 
 import dynamic from 'next/dynamic';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { 
   Play, 
   Save, 
@@ -14,7 +14,12 @@ import {
   Plus,
   X,
   FilePlus,
-  FolderPlus
+  FolderPlus,
+  Wand2,
+  AlertCircle,
+  CheckCircle,
+  Info,
+  Zap
 } from 'lucide-react';
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), {
@@ -42,6 +47,13 @@ interface Tab {
   content: string;
   language: string;
   isDirty: boolean;
+}
+
+interface LogEntry {
+  timestamp: string;
+  level: 'info' | 'success' | 'warning' | 'error';
+  message: string;
+  details?: Record<string, any>;
 }
 
 const defaultFiles: FileItem[] = [
@@ -139,12 +151,23 @@ export default function IDEPage() {
   const [showNewFolderDialog, setShowNewFolderDialog] = useState(false);
   const [newItemName, setNewItemName] = useState('');
   
+  // Logger state
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [isFixing, setIsFixing] = useState(false);
+  const [showLogger, setShowLogger] = useState(false);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+  
   useEffect(() => {
     const mainFile = findFileById(files, 'main.py');
     if (mainFile) {
       openFile(mainFile);
     }
   }, []);
+  
+  // Auto-scroll logs to bottom
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
   
   const findFileById = (items: FileItem[], id: string): FileItem | null => {
     for (const item of items) {
@@ -334,6 +357,101 @@ export default function IDEPage() {
     
     setTerminalInput('');
   };
+
+  const addLog = (level: LogEntry['level'], message: string, details?: Record<string, any>) => {
+    setLogs(prev => [...prev, {
+      timestamp: new Date().toLocaleTimeString(),
+      level,
+      message,
+      details
+    }]);
+  };
+
+  const fixCode = async () => {
+    const activeTabData = tabs.find(tab => tab.id === activeTab);
+    if (!activeTabData) {
+      addLog('error', '❌ No file open to fix', {});
+      return;
+    }
+
+    setIsFixing(true);
+    setShowLogger(true);
+    setLogs([]); // Clear previous logs
+
+    addLog('info', `🚀 Starting AI-powered code fix...`, { file: activeTabData.name, language: activeTabData.language });
+
+    try {
+      const response = await fetch('http://localhost:8000/api/fix-continuously', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: activeTabData.content,
+          language: activeTabData.language,
+          file_path: activeTabData.name,
+          max_iterations: 5
+        })
+      });
+
+      if (!response.ok) {
+        addLog('error', `❌ API Error: ${response.statusText}`, {});
+        setIsFixing(false);
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        addLog('error', '❌ Failed to read response', {});
+        setIsFixing(false);
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+
+          try {
+            const event = JSON.parse(line);
+
+            if (event.event === 'log') {
+              const logData = event.data;
+              addLog(logData.level, logData.message, logData.details);
+            } else if (event.event === 'patch') {
+              addLog('success', `✨ Patch ${event.index + 1} generated`, {
+                explanation: event.data.fix_explanation,
+                confidence: event.data.confidence
+              });
+            } else if (event.event === 'complete') {
+              addLog('success', `✅ Fixing complete!`, { session_id: event.session_id });
+
+              // Update the editor with fixed code
+              updateTabContent(activeTab!, event.fixed_code);
+
+              addToTerminal(`\n✨ AI Fixed code! Applied fixes and updated editor.`);
+              setIsFixing(false);
+            } else if (event.event === 'error') {
+              addLog('error', `❌ ${event.message}`, {});
+              setIsFixing(false);
+            }
+          } catch (e) {
+            console.error('Failed to parse event:', line, e);
+          }
+        }
+      }
+    } catch (error) {
+      addLog('error', `❌ Network error: ${error instanceof Error ? error.message : String(error)}`, {});
+      setIsFixing(false);
+    }
+  };
   
   const renderFileTree = (items: FileItem[], depth = 0) => {
     return items.map(item => (
@@ -465,6 +583,19 @@ export default function IDEPage() {
             >
               <Play className="w-4 h-4" />
             </button>
+
+            <button
+              onClick={fixCode}
+              disabled={!activeTab || isFixing}
+              className={`p-2 rounded transition-colors ${
+                activeTab && !isFixing
+                  ? 'bg-purple-600 hover:bg-purple-700' 
+                  : 'bg-gray-600 cursor-not-allowed'
+              }`}
+              title="Fix Code with AI"
+            >
+              <Wand2 className="w-4 h-4" />
+            </button>
             
             <button
               onClick={() => setShowTerminal(!showTerminal)}
@@ -476,6 +607,18 @@ export default function IDEPage() {
               title="Toggle Terminal"
             >
               <Terminal className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setShowLogger(!showLogger)}
+              className={`p-2 rounded transition-colors ${
+                showLogger
+                  ? 'bg-blue-600 hover:bg-blue-700' 
+                  : 'bg-gray-600 hover:bg-gray-700'
+              }`}
+              title="Toggle AI Logger"
+            >
+              <Zap className="w-4 h-4" />
             </button>
           </div>
         </div>
@@ -549,73 +692,137 @@ export default function IDEPage() {
             </div>
           )}
 
-          {/* Editor */}
-          <div className={`flex-1 ${showTerminal ? 'h-1/2' : 'h-full'}`}>
-            {activeTabData ? (
-              <MonacoEditor
-                height="100%"
-                language={activeTabData.language}
-                value={activeTabData.content}
-                onChange={(value) => updateTabContent(activeTab!, value || '')}
-                theme="vs-dark"
-                options={{
-                  fontSize: 14,
-                  minimap: { enabled: false },
-                  scrollBeyondLastLine: false,
-                  wordWrap: 'on',
-                  automaticLayout: true,
-                }}
-              />
-            ) : (
-              <div className="h-full flex items-center justify-center text-gray-500">
-                <div className="text-center">
-                  <File className="w-16 h-16 mx-auto mb-4 opacity-50" />
-                  <p className="text-lg mb-2">Welcome to CodeIDE!</p>
-                  <p className="text-sm">Open a file from the explorer to start editing</p>
+          {/* Editor & Terminal Container */}
+          <div className="flex flex-1 overflow-hidden">
+            {/* Editor */}
+            <div className={`flex-1 flex flex-col ${showTerminal ? '' : ''}`}>
+              <div className="flex-1">
+                {activeTabData ? (
+                  <MonacoEditor
+                    height="100%"
+                    language={activeTabData.language}
+                    value={activeTabData.content}
+                    onChange={(value) => updateTabContent(activeTab!, value || '')}
+                    theme="vs-dark"
+                    options={{
+                      fontSize: 14,
+                      minimap: { enabled: false },
+                      scrollBeyondLastLine: false,
+                      wordWrap: 'on',
+                      automaticLayout: true,
+                    }}
+                  />
+                ) : (
+                  <div className="h-full flex items-center justify-center text-gray-500">
+                    <div className="text-center">
+                      <File className="w-16 h-16 mx-auto mb-4 opacity-50" />
+                      <p className="text-lg mb-2">Welcome to CodeIDE!</p>
+                      <p className="text-sm">Open a file from the explorer to start editing</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Terminal */}
+              {showTerminal && (
+                <div className="h-1/3 bg-[#1e1e1e] border-t border-gray-700 flex flex-col">
+                  <div className="p-2 bg-[#2d2d30] border-b border-gray-700 flex items-center">
+                    <Terminal className="w-4 h-4 mr-2" />
+                    <span className="text-sm text-gray-300">Terminal</span>
+                    <button
+                      onClick={() => setShowTerminal(false)}
+                      className="ml-auto p-1 hover:bg-gray-600 rounded"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                  
+                  <div className="flex-1 p-3 overflow-auto font-mono text-sm">
+                    {terminalOutput.map((line: string, index: number) => (
+                      <div key={index} className="mb-1 text-gray-300">
+                        {line}
+                      </div>
+                    ))}
+                    
+                    <div className="flex items-center mt-2">
+                      <span className="text-green-400 mr-2">$</span>
+                      <input
+                        type="text"
+                        value={terminalInput}
+                        onChange={(e) => setTerminalInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            handleTerminalCommand(terminalInput);
+                          }
+                        }}
+                        className="flex-1 bg-transparent outline-none text-white"
+                        placeholder="Type a command..."
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Logger Sidebar */}
+            {showLogger && (
+              <div className="w-80 bg-[#1e1e1e] border-l border-gray-700 flex flex-col">
+                <div className="p-2 bg-[#2d2d30] border-b border-gray-700 flex items-center justify-between">
+                  <div className="flex items-center">
+                    <Zap className="w-4 h-4 mr-2 text-yellow-400" />
+                    <span className="text-sm text-gray-300 font-medium">AI Logger</span>
+                    {isFixing && <span className="ml-2 text-xs text-yellow-400 animate-pulse">fixing...</span>}
+                  </div>
+                  <button
+                    onClick={() => setShowLogger(false)}
+                    className="p-1 hover:bg-gray-600 rounded"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="flex-1 p-3 overflow-auto font-mono text-xs space-y-2">
+                  {logs.length === 0 ? (
+                    <div className="text-gray-500 text-center py-8">
+                      <p>No logs yet</p>
+                      <p className="text-xs mt-2">Click "Fix" button to start</p>
+                    </div>
+                  ) : (
+                    logs.map((log, index) => (
+                      <div key={index} className="mb-2">
+                        <div className="flex items-start gap-2">
+                          {log.level === 'info' && <Info className="w-3 h-3 mt-0.5 text-blue-400 flex-shrink-0" />}
+                          {log.level === 'success' && <CheckCircle className="w-3 h-3 mt-0.5 text-green-400 flex-shrink-0" />}
+                          {log.level === 'warning' && <AlertCircle className="w-3 h-3 mt-0.5 text-yellow-400 flex-shrink-0" />}
+                          {log.level === 'error' && <AlertCircle className="w-3 h-3 mt-0.5 text-red-400 flex-shrink-0" />}
+                          
+                          <div className="flex-1 min-w-0">
+                            <div className={`break-words ${
+                              log.level === 'success' ? 'text-green-400' :
+                              log.level === 'error' ? 'text-red-400' :
+                              log.level === 'warning' ? 'text-yellow-400' :
+                              'text-gray-400'
+                            }`}>
+                              {log.message}
+                            </div>
+                            {log.details && (
+                              <div className="text-xs text-gray-500 mt-1">
+                                {Object.entries(log.details).map(([key, value]) => (
+                                  <div key={key}>{key}: {JSON.stringify(value).substring(0, 50)}</div>
+                                ))}
+                              </div>
+                            )}
+                            <div className="text-xs text-gray-600 mt-1">{log.timestamp}</div>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                  <div ref={logsEndRef} />
                 </div>
               </div>
             )}
           </div>
-
-          {/* Terminal */}
-          {showTerminal && (
-            <div className="h-1/2 bg-[#1e1e1e] border-t border-gray-700 flex flex-col">
-              <div className="p-2 bg-[#2d2d30] border-b border-gray-700 flex items-center">
-                <Terminal className="w-4 h-4 mr-2" />
-                <span className="text-sm text-gray-300">Terminal</span>
-                <button
-                  onClick={() => setShowTerminal(false)}
-                  className="ml-auto p-1 hover:bg-gray-600 rounded"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-              
-              <div className="flex-1 p-3 overflow-auto font-mono text-sm">
-                {terminalOutput.map((line, index) => (
-                  <div key={index} className="mb-1 text-gray-300">
-                    {line}
-                  </div>
-                ))}
-                
-                <div className="flex items-center mt-2">
-                  <span className="text-green-400 mr-2">$</span>
-                  <input
-                    type="text"
-                    value={terminalInput}
-                    onChange={(e) => setTerminalInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        handleTerminalCommand(terminalInput);
-                      }
-                    }}
-                    className="flex-1 bg-transparent outline-none text-white"
-                    placeholder="Type a command..."
-                  />
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       </div>
     </div>
