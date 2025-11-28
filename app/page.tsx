@@ -157,6 +157,8 @@ export default function IDEPage() {
   const [showLogger, setShowLogger] = useState(false);
   const [pendingPatch, setPendingPatch] = useState<any>(null);
   const [showPatchDialog, setShowPatchDialog] = useState(false);
+  const [pendingPreview, setPendingPreview] = useState<any>(null);
+  const [showApplyConfirm, setShowApplyConfirm] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
   
   useEffect(() => {
@@ -170,6 +172,47 @@ export default function IDEPage() {
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
+
+  // When a patch is pending, execute the patched code to show a preview
+  useEffect(() => {
+    let mounted = true;
+    const fetchPreview = async () => {
+      if (!pendingPatch) {
+        setPendingPreview(null);
+        return;
+      }
+
+      try {
+        const resp = await fetch('http://localhost:8000/api/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code: pendingPatch.data.patched_content,
+            language: getLanguageFromExtension(pendingPatch.data.file_path || 'main.py'),
+            file_path: pendingPatch.data.file_path || 'main.py'
+          })
+        });
+
+        if (!mounted) return;
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          setPendingPreview({ stdout: '', stderr: `Execution error: ${err.detail || resp.statusText}` });
+          return;
+        }
+
+        const json = await resp.json();
+        if (!mounted) return;
+        setPendingPreview(json);
+      } catch (e) {
+        if (!mounted) return;
+        setPendingPreview({ stdout: '', stderr: `Connection error: ${e instanceof Error ? e.message : String(e)}` });
+      }
+    };
+
+    fetchPreview();
+    return () => { mounted = false; };
+  }, [pendingPatch]);
   
   const findFileById = (items: FileItem[], id: string): FileItem | null => {
     for (const item of items) {
@@ -298,30 +341,60 @@ export default function IDEPage() {
     addToTerminal(`✅ File '${tabs.find(t => t.id === activeTab)?.name}' saved successfully!`);
   };
   
-  const runCode = () => {
+  const runCode = async () => {
     const activeTabData = tabs.find(tab => tab.id === activeTab);
     if (!activeTabData) return;
+    // Ensure terminal is visible when running
+    setShowTerminal(true);
+    setTerminalOutput(prev => [...prev, `\n🚀 Running ${activeTabData.name}...`]);
     
-    addToTerminal(`\n🚀 Running ${activeTabData.name}...`);
-    
-    if (activeTabData.language === 'python') {
-      addToTerminal("Python execution simulation:");
-      addToTerminal("Hello, World!");
-      addToTerminal("10 + 5 = 15");
-      addToTerminal("Sum: 15");
-      addToTerminal("Average: 3.0");
-    } else if (activeTabData.language === 'javascript') {
-      addToTerminal("JavaScript execution simulation:");
-      addToTerminal("Welcome to CodeIDE!");
-      addToTerminal("Hello, World!");
-      addToTerminal("Hello, CodeIDE!");
-      addToTerminal("Sum: 15");
-    } else {
-      addToTerminal(`File type: ${activeTabData.language}`);
-      addToTerminal("(Execution simulation)");
+    try {
+      const response = await fetch('http://localhost:8000/api/execute', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          code: activeTabData.content,
+          language: activeTabData.language,
+          file_path: activeTabData.name
+        })
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        addToTerminal(`❌ Error: ${error.detail || 'Failed to execute code'}`);
+        addToTerminal(`Exit code: ${error.status || response.status}`);
+        return;
+      }
+      
+      const result = await response.json();
+      
+      // Display stdout (preserve blank lines)
+      addToTerminal('\n--- STDOUT ---');
+      if (typeof result.stdout === 'string' && result.stdout.length > 0) {
+        result.stdout.split('\n').forEach((line: string) => addToTerminal(line));
+      } else {
+        addToTerminal('<no stdout>');
+      }
+
+      // Display stderr (always show if present)
+      if (typeof result.stderr === 'string' && result.stderr.length > 0) {
+        addToTerminal('\n--- STDERR ---');
+        result.stderr.split('\n').forEach((line: string) => addToTerminal(line));
+      }
+
+      // Execution summary
+      addToTerminal('\n--- SUMMARY ---');
+      addToTerminal(`Exit code: ${result.exit_code}`);
+      addToTerminal(`Execution time: ${result.execution_time?.toFixed(2) || '0'}s`);
+      addToTerminal('');
+      
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      addToTerminal(`❌ Connection error: ${errorMsg}`);
+      addToTerminal('Make sure the API server is running on http://localhost:8000');
     }
-    
-    addToTerminal("✅ Execution completed.\n");
   };
   
   const addToTerminal = (text: string) => {
@@ -431,8 +504,7 @@ export default function IDEPage() {
               addLog(logData.level, logData.message, logData.details);
             } else if (event.event === 'patch') {
               addLog('success', `✨ Patch ${event.index + 1} generated`, {
-                explanation: event.data.fix_explanation,
-                confidence: event.data.confidence
+                explanation: event.data.fix_explanation
               });
 
               // Store patch and show confirmation dialog
@@ -482,17 +554,52 @@ export default function IDEPage() {
     }
   };
 
-  const approvePatch = () => {
-    addLog('success', `✅ Patch approved and applied!`, {});
+  const approvePatch = async () => {
+    if (!pendingPatch) return;
+    const patchData = pendingPatch.data;
+
+    // Apply the patched content to the active tab
+    if (activeTab) {
+      updateTabContent(activeTab, patchData.patched_content);
+      addLog('success', `✅ Patch applied: ${patchData.fix_explanation}`);
+    }
+
+    // After applying locally, execute the patched code to show final output
+    try {
+      const resp = await fetch('http://localhost:8000/api/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: patchData.patched_content, language: getLanguageFromExtension(patchData.file_path || 'main.py'), file_path: patchData.file_path || 'main.py' })
+      });
+
+      if (resp.ok) {
+        const json = await resp.json();
+        if (json.stdout) {
+          addToTerminal('\n▶️ Output after applying patch:');
+          json.stdout.split('\n').forEach((l: string) => l && addToTerminal(l));
+        }
+        if (json.stderr) {
+          addToTerminal('\n⚠️ Errors after applying patch:');
+          json.stderr.split('\n').forEach((l: string) => l && addToTerminal(`  ${l}`));
+        }
+      } else {
+        addToTerminal('\n⚠️ Failed to execute patched code (server error)');
+      }
+    } catch (e) {
+      addToTerminal(`\n⚠️ Could not run patched code: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
     setShowPatchDialog(false);
     setPendingPatch(null);
+    setPendingPreview(null);
   };
 
   const rejectPatch = () => {
     addLog('warning', `⏭️ Patch skipped by user`, {});
+    // Close dialog and allow the stream to continue
     setShowPatchDialog(false);
     setPendingPatch(null);
-    setIsFixing(false);
+    // Do not set isFixing to false here; let the continuous fixer continue
   };
   
   const renderFileTree = (items: FileItem[], depth = 0) => {
@@ -533,50 +640,147 @@ export default function IDEPage() {
     <div className="h-screen flex flex-col bg-[#1e1e1e] text-white">
       {/* Patch Confirmation Dialog */}
       {showPatchDialog && pendingPatch && (
-        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50">
-          <div className="bg-[#2d2d30] p-8 rounded-lg shadow-2xl w-96 max-h-96 flex flex-col">
-            <div className="flex items-center mb-4">
-              <Wand2 className="w-5 h-5 mr-2 text-purple-400" />
-              <h3 className="text-lg font-semibold">Review Patch #{pendingPatch.index + 1}</h3>
+        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+          <div className="bg-[#2d2d30] rounded-lg shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden">
+            {/* Header */}
+            <div className="bg-[#1e1e1e] px-6 py-4 border-b border-gray-700 flex items-center justify-between">
+              <div className="flex items-center">
+                <Wand2 className="w-5 h-5 mr-2 text-purple-400" />
+                <h3 className="text-lg font-semibold">Review Patch #{pendingPatch.index + 1}</h3>
+              </div>
+              <button
+                onClick={() => setShowPatchDialog(false)}
+                className="text-gray-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
-            <div className="flex-1 overflow-auto mb-4">
-              <div className="bg-[#1e1e1e] p-3 rounded text-sm">
-                <p className="text-gray-300 mb-2">
-                  <strong>Explanation:</strong>
+            {/* Main Content */}
+            <div className="flex-1 overflow-auto p-6 space-y-6">
+              {/* Error Info */}
+              <div className="bg-red-900 bg-opacity-20 border border-red-700 rounded p-4">
+                <p className="text-gray-300 mb-1">
+                  <strong>Error Fixed:</strong>
                 </p>
-                <p className="text-gray-200 mb-3">
-                  {pendingPatch.explanation}
-                </p>
-                
-                <p className="text-gray-300 mb-2">
-                  <strong>Confidence:</strong>
-                </p>
-                <div className="w-full bg-gray-700 rounded h-2 mb-3">
-                  <div
-                    className="bg-green-500 h-2 rounded transition-all"
-                    style={{ width: `${(pendingPatch.data.confidence || 0) * 100}%` }}
-                  />
-                </div>
-                <p className="text-xs text-gray-400">
-                  {Math.round((pendingPatch.data.confidence || 0) * 100)}% confidence
+                <p className="text-red-300 font-mono text-sm">
+                  {pendingPatch.data.error_fixed}
                 </p>
               </div>
+
+              {/* Explanation */}
+              <div>
+                <p className="text-gray-300 mb-2 font-semibold">
+                  💡 What Changed:
+                </p>
+                <p className="text-gray-200 bg-[#1e1e1e] p-3 rounded">
+                  {pendingPatch.explanation}
+                </p>
+              </div>
+
+              {/* Confidence removed per user request */}
+
+              {/* Preview Execution Output */}
+              {pendingPreview && (
+                <div>
+                  <p className="text-gray-300 mb-2 font-semibold">▶️ Preview Execution Output (patched code)</p>
+                  <div className="bg-[#0f1720] rounded border border-gray-700 p-3 max-h-40 overflow-auto font-mono text-xs">
+                    {pendingPreview.stdout && (
+                      <div className="text-gray-200">
+                        {pendingPreview.stdout.split('\n').map((l: string, i: number) => (
+                          <div key={i} className="text-gray-200">{l}</div>
+                        ))}
+                      </div>
+                    )}
+                    {pendingPreview.stderr && (
+                      <div className="mt-2 text-red-400">
+                        {pendingPreview.stderr.split('\n').map((l: string, i: number) => (
+                          <div key={i}>{l}</div>
+                        ))}
+                      </div>
+                    )}
+                    {!pendingPreview.stdout && !pendingPreview.stderr && (
+                      <div className="text-gray-500 italic">No output (maybe execution timed out)</div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Changed Lines Preview: show the exact original line(s) and what they'll become */}
+              {pendingPatch.data.line_edits && pendingPatch.data.line_edits.length > 0 && (
+                <div>
+                  <p className="text-gray-300 mb-2 font-semibold">🛠️ Changed Lines Preview</p>
+                  <div className="bg-[#111214] rounded border border-gray-700 p-3 max-h-36 overflow-auto font-mono text-sm">
+                    {(() => {
+                      const origLines: string[] = (pendingPatch.data.original_content || '').split('\n');
+                      return pendingPatch.data.line_edits.map((edit: any, idx: number) => {
+                        const start = Math.max(1, edit.start_line || 1);
+                        const end = Math.max(start, edit.end_line || start);
+                        const original = origLines.slice(start - 1, end).join('\n');
+                        const replacement = (edit.replacement || '').trim();
+                        return (
+                          <div key={idx} className="mb-3">
+                            <div className="text-xs text-gray-400 mb-1">Lines {start}{end>start?`-${end}`:''} will change:</div>
+                            <div className="bg-[#0b1220] p-2 rounded">
+                              <div className="text-gray-400">Original:</div>
+                              <pre className="whitespace-pre-wrap text-sm text-gray-300 bg-transparent p-1">{original}</pre>
+                              <div className="text-gray-400 mt-1">Replacement:</div>
+                              <pre className="whitespace-pre-wrap text-sm text-green-300 bg-transparent p-1">{replacement || '<empty>'}</pre>
+                            </div>
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                </div>
+              )}
             </div>
 
-            <div className="flex gap-3">
+            {/* Footer Actions */}
+            <div className="bg-[#1e1e1e] px-6 py-4 border-t border-gray-700 flex gap-3 justify-end">
               <button
                 onClick={rejectPatch}
-                className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 rounded font-medium transition-colors"
+                className="px-6 py-2 bg-red-600 hover:bg-red-700 rounded font-medium transition-colors flex items-center gap-2"
               >
-                ❌ Skip
+                <X className="w-4 h-4" /> Skip Patch
               </button>
               <button
-                onClick={approvePatch}
-                className="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 rounded font-medium transition-colors"
+                onClick={() => setShowApplyConfirm(true)}
+                className="px-6 py-2 bg-green-600 hover:bg-green-700 rounded font-medium transition-colors flex items-center gap-2"
               >
-                ✅ Apply
+                <CheckCircle className="w-4 h-4" /> Apply Patch
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Apply Confirmation Modal - shows edited line(s) before final apply */}
+      {showApplyConfirm && pendingPatch && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-60">
+          <div className="bg-[#1e1e1e] rounded-lg shadow-xl w-96 p-5">
+            <h4 className="text-lg font-semibold mb-3">Confirm Apply Patch</h4>
+            <p className="text-sm text-gray-300 mb-3">The following line(s) will be changed. Confirm to apply.</p>
+            <div className="bg-[#0b1220] p-3 rounded max-h-40 overflow-auto font-mono text-sm mb-4">
+              {pendingPatch.data.line_edits && pendingPatch.data.line_edits.length > 0 ? (
+                pendingPatch.data.line_edits.map((edit: any, i: number) => {
+                  const start = Math.max(1, edit.start_line || 1);
+                  const end = Math.max(start, edit.end_line || start);
+                  const replacement = (edit.replacement || '').trim() || '<empty>';
+                  return (
+                    <div key={i} className="mb-3">
+                      <div className="text-xs text-gray-400">Lines {start}{end>start?`-${end}`:''} →</div>
+                      <pre className="whitespace-pre-wrap text-sm text-green-300 bg-transparent p-1">{replacement}</pre>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="text-gray-400">No line edits available to preview.</div>
+              )}
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setShowApplyConfirm(false)} className="px-4 py-2 bg-gray-700 rounded">Cancel</button>
+              <button onClick={async () => { setShowApplyConfirm(false); await approvePatch(); }} className="px-4 py-2 bg-green-600 rounded text-white">Confirm Apply</button>
             </div>
           </div>
         </div>
@@ -819,26 +1023,48 @@ export default function IDEPage() {
               {/* Terminal */}
               {showTerminal && (
                 <div className="h-1/3 bg-[#1e1e1e] border-t border-gray-700 flex flex-col">
-                  <div className="p-2 bg-[#2d2d30] border-b border-gray-700 flex items-center">
-                    <Terminal className="w-4 h-4 mr-2" />
-                    <span className="text-sm text-gray-300">Terminal</span>
+                  <div className="p-2 bg-[#2d2d30] border-b border-gray-700 flex items-center justify-between">
+                    <div className="flex items-center">
+                      <Terminal className="w-4 h-4 mr-2" />
+                      <span className="text-sm text-gray-300">Terminal Output</span>
+                      <span className="ml-2 text-xs text-gray-500">({terminalOutput.length} lines)</span>
+                    </div>
                     <button
                       onClick={() => setShowTerminal(false)}
-                      className="ml-auto p-1 hover:bg-gray-600 rounded"
+                      className="p-1 hover:bg-gray-600 rounded"
                     >
                       <X className="w-4 h-4" />
                     </button>
                   </div>
                   
                   <div className="flex-1 p-3 overflow-auto font-mono text-sm">
-                    {terminalOutput.map((line: string, index: number) => (
-                      <div key={index} className="mb-1 text-gray-300">
-                        {line}
-                      </div>
-                    ))}
+                    {terminalOutput.map((line: string, index: number) => {
+                      let className = "mb-1 text-gray-300";
+                      
+                      // Color code based on content
+                      if (line.includes('✅') || line.includes('success')) {
+                        className = "mb-1 text-green-400";
+                      } else if (line.includes('❌') || line.includes('error') || line.includes('Error')) {
+                        className = "mb-1 text-red-400";
+                      } else if (line.includes('⚠️') || line.includes('warning')) {
+                        className = "mb-1 text-yellow-400";
+                      } else if (line.includes('🚀') || line.includes('Running')) {
+                        className = "mb-1 text-blue-400 font-semibold";
+                      } else if (line.includes('✨')) {
+                        className = "mb-1 text-purple-400";
+                      } else if (line.startsWith('$') || line.startsWith('>')) {
+                        className = "mb-1 text-green-500 font-semibold";
+                      }
+                      
+                      return (
+                        <div key={index} className={className}>
+                          {line}
+                        </div>
+                      );
+                    })}
                     
                     <div className="flex items-center mt-2">
-                      <span className="text-green-400 mr-2">$</span>
+                      <span className="text-green-400 mr-2 font-semibold">$</span>
                       <input
                         type="text"
                         value={terminalInput}
@@ -848,8 +1074,9 @@ export default function IDEPage() {
                             handleTerminalCommand(terminalInput);
                           }
                         }}
-                        className="flex-1 bg-transparent outline-none text-white"
+                        className="flex-1 bg-transparent outline-none text-white placeholder-gray-600"
                         placeholder="Type a command..."
+                        autoFocus
                       />
                     </div>
                   </div>

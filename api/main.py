@@ -33,7 +33,7 @@ app.add_middleware(
 
 # Ollama configuration
 OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL = "deepseek-coder:1.3b"
+DEFAULT_MODEL = "qwen2.5-coder:1.5b"
 
 # =============================================================================
 # Models
@@ -121,13 +121,66 @@ class OllamaClient:
         self.model = model
         
     async def check_connection(self) -> bool:
-        """Check if Ollama is running"""
+        """Check if Ollama is running, attempt to restart if down"""
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(f"{self.base_url}/api/tags")
-                return response.status_code == 200
-        except:
-            return False
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{self.base_url}/api/tags", timeout=5.0)
+                if response.status_code == 200:
+                    return True
+        except Exception as e:
+            print(f"[Ollama] Connection check failed: {e}")
+        
+        # Attempt to start Ollama if not running
+        print("[Ollama] Connection lost. Attempting to restart Ollama...")
+        try:
+            if self._try_start_ollama():
+                await asyncio.sleep(3)  # Give Ollama time to start
+                # Retry connection
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        response = await client.get(f"{self.base_url}/api/tags", timeout=5.0)
+                        if response.status_code == 200:
+                            print("[Ollama] Successfully restarted")
+                            return True
+                except:
+                    pass
+        except Exception as e:
+            print(f"[Ollama] Restart attempt failed: {e}")
+        
+        return False
+    
+    @staticmethod
+    def _try_start_ollama() -> bool:
+        """Attempt to start Ollama service"""
+        try:
+            import platform
+            if platform.system() == "Windows":
+                # Windows: try to start Ollama process
+                import subprocess
+                try:
+                    # Check if already running
+                    result = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=5)
+                    if "ollama" not in result.stdout.lower():
+                        print("[Ollama] Starting Ollama service...")
+                        subprocess.Popen(["ollama", "serve"], 
+                                       stdout=subprocess.DEVNULL, 
+                                       stderr=subprocess.DEVNULL)
+                        return True
+                    else:
+                        print("[Ollama] Process exists but not responding")
+                except Exception as e:
+                    print(f"[Ollama] Could not start on Windows: {e}")
+            else:
+                # Linux/Mac: try systemctl or direct command
+                import subprocess
+                subprocess.run(["ollama", "serve"], 
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             timeout=2)
+                return True
+        except Exception as e:
+            print(f"[Ollama] Start attempt failed: {e}")
+        return False
 
     async def ensure_model_available(self) -> bool:
         """Ensure the configured model is available in the local Ollama runtime.
@@ -198,67 +251,135 @@ class OllamaClient:
             return False
     
     async def generate(self, prompt: str, system: str = "", temperature: float = 0.1) -> str:
-        """Generate text using Ollama"""
+        """Generate text using Ollama with crash recovery and memory efficiency"""
         # Ensure the model exists before attempting generation. If missing,
         # try to pull it (CLI) and re-check.
         available = await self.ensure_model_available()
         if not available:
             raise HTTPException(status_code=503, detail=f"Ollama model '{self.model}' is not available and could not be pulled automatically.")
 
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    f"{self.base_url}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "system": system,
-                        "stream": False,
-                        "options": {
-                            "temperature": temperature,
-                            "num_predict": 2048
-                        }
-                    }
-                )
+        # Truncate very long prompts to prevent llama runner crashes from memory pressure
+        max_prompt_length = 2000
+        if len(prompt) > max_prompt_length:
+            prompt = prompt[:max_prompt_length] + "\n... (truncated)"
+            print(f"[Ollama] Prompt truncated to {max_prompt_length} chars")
 
-                # If Ollama responds with a specific model-missing error, attempt a CLI pull and retry once
-                if response.status_code != 200:
+        max_retries = 4
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    print(f"[Ollama] Generation attempt {attempt + 1}/{max_retries}")
+                    
+                    # Use smaller num_predict to reduce memory usage
+                    # Also reduce temperature on retry to get more consistent outputs
+                    temp = max(0.01, temperature - (attempt * 0.03))
+                    num_predict = 512 if attempt > 0 else 768
+                    
                     try:
-                        body = response.json()
-                        msg = json.dumps(body)
-                    except Exception:
-                        msg = await response.aread() if hasattr(response, "aread") else str(response.text)
-
-                    if response.status_code in (400, 404) or "model" in msg.lower():
-                        # Try pulling the model and retrying once
-                        pulled = await self.ensure_model_available()
-                        if pulled:
-                            # Retry generate
-                            retry_resp = await client.post(
-                                f"{self.base_url}/api/generate",
-                                json={
-                                    "model": self.model,
-                                    "prompt": prompt,
-                                    "system": system,
-                                    "stream": False,
-                                    "options": {
-                                        "temperature": temperature,
-                                        "num_predict": 2048
-                                    }
+                        response = await client.post(
+                            f"{self.base_url}/api/generate",
+                            json={
+                                "model": self.model,
+                                "prompt": prompt,
+                                "system": system,
+                                "stream": False,
+                                "options": {
+                                    "temperature": temp,
+                                    "num_predict": num_predict,
+                                    "top_p": 0.9,
+                                    "top_k": 40
                                 }
-                            )
-                            if retry_resp.status_code == 200:
-                                return retry_resp.json().get("response", "")
+                            },
+                            timeout=120.0
+                        )
+                    except Exception as e:
+                        last_error = f"Connection error: {str(e)}"
+                        print(f"[Ollama] Connection failed on attempt {attempt + 1}: {last_error}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(3.0 + (attempt * 2))
+                            continue
+                        else:
+                            raise HTTPException(status_code=500, detail=last_error)
+
+                    # If Ollama responds with a specific model-missing error, attempt a CLI pull and retry once
+                    if response.status_code != 200:
+                        try:
+                            body = response.json()
+                            msg = json.dumps(body)
+                        except Exception:
+                            msg = str(response.text) if hasattr(response, "text") else "Unknown error"
+
+                        last_error = f"Ollama generation failed: {msg}"
+                        print(f"[Ollama] Error on attempt {attempt + 1}: {last_error}")
+                        
+                        # Check for runner crash - this needs special handling
+                        if "process has terminated" in msg.lower() or "exit status" in msg.lower() or "runner" in msg.lower():
+                            print(f"[Ollama] Detected llama runner crash. Waiting 5s before retry...")
+                            await asyncio.sleep(5.0 + (attempt * 2))
+                            
+                            # Force reconnect
+                            try:
+                                await self.check_connection()
+                            except Exception as e:
+                                print(f"[Ollama] Connection check failed: {str(e)}")
+                            
+                            if attempt < max_retries - 1:
+                                continue
                             else:
-                                raise HTTPException(status_code=500, detail="Ollama generation failed after pulling model")
+                                raise HTTPException(status_code=500, detail=last_error)
+                        
+                        if response.status_code in (400, 404) or "model" in msg.lower():
+                            # Try pulling the model and retrying once
+                            pulled = await self.ensure_model_available()
+                            if pulled and attempt < max_retries - 1:
+                                print(f"[Ollama] Model pulled. Retrying...")
+                                await asyncio.sleep(1.0)
+                                continue
+                        
+                        if attempt < max_retries - 1:
+                            print(f"[Ollama] Retrying with reduced prompt size...")
+                            await asyncio.sleep(2.0 + attempt)
+                            continue
+                        else:
+                            raise HTTPException(status_code=500, detail=last_error)
 
-                    raise HTTPException(status_code=500, detail=f"Ollama generation failed: {msg}")
-
-                return response.json().get("response", "")
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
+                    result = response.json().get("response", "").strip()
+                    if not result:
+                        last_error = "Ollama returned empty response"
+                        if attempt < max_retries - 1:
+                            print(f"[Ollama] Empty response. Retrying...")
+                            await asyncio.sleep(1.0)
+                            continue
+                        else:
+                            raise HTTPException(status_code=500, detail=last_error)
+                    
+                    print(f"[Ollama] Generation succeeded on attempt {attempt + 1}")
+                    return result
+                    
+            except asyncio.TimeoutError as e:
+                last_error = f"Ollama timeout on attempt {attempt + 1}"
+                print(f"[Ollama] {last_error}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(3.0 + (attempt * 2))
+                    continue
+                else:
+                    raise HTTPException(status_code=500, detail=last_error)
+            
+            except HTTPException:
+                raise
+            
+            except Exception as e:
+                last_error = f"Ollama error: {str(e)}"
+                print(f"[Ollama] Exception on attempt {attempt + 1}: {last_error}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2.0 + attempt)
+                    continue
+                else:
+                    raise HTTPException(status_code=500, detail=last_error)
+        
+        raise HTTPException(status_code=500, detail=f"Ollama generation failed after {max_retries} attempts: {last_error}")
 
 ollama = OllamaClient()
 
@@ -439,6 +560,175 @@ class ErrorAnalyzer:
         if error_type in auto_fixable:
             return ErrorCategory.AUTO_FIXABLE
         
+        # Default to AUTO_FIXABLE for unknown/logic errors
+        return ErrorCategory.AUTO_FIXABLE
+    
+    @staticmethod
+    def detect_tree_traversal_bugs(code: str, stdout: str) -> Optional[FileError]:
+        """Detect tree traversal logic errors (preorder, inorder, postorder)"""
+        
+        # Check if this is tree traversal code
+        if "preorder" not in code.lower() and "inorder" not in code.lower() and "postorder" not in code.lower():
+            return None
+        
+        if "class Node" not in code:
+            return None
+        
+        # Pattern detection for traversal bugs
+        preorder_bugs = []
+        inorder_bugs = []
+        postorder_bugs = []
+        
+        # Preorder should be: root -> left -> right
+        if "def preorder" in code.lower():
+            preorder_pattern = r'def preorder.*?:\s*\n(.*?)(?=\ndef|\nclass|\Z)'
+            preorder_match = re.search(preorder_pattern, code, re.DOTALL | re.IGNORECASE)
+            
+            if preorder_match:
+                preorder_body = preorder_match.group(1)
+                
+                # Find positions of key operations
+                append_pos = preorder_body.find("append") if "append" in preorder_body else -1
+                left_call = preorder_body.find(".left") if ".left" in preorder_body else -1
+                right_call = preorder_body.find(".right") if ".right" in preorder_body else -1
+                
+                # In correct preorder, append should come before left/right recursive calls
+                if append_pos > 0 and left_call > 0 and append_pos > left_call:
+                    preorder_bugs.append("Appending happens AFTER left traversal (should be before)")
+                
+                if left_call > 0 and right_call > 0 and right_call < left_call:
+                    preorder_bugs.append("Right traversal before left traversal")
+        
+        # Inorder should be: left -> root -> right
+        if "def inorder" in code.lower():
+            inorder_pattern = r'def inorder.*?:\s*\n(.*?)(?=\ndef|\nclass|\Z)'
+            inorder_match = re.search(inorder_pattern, code, re.DOTALL | re.IGNORECASE)
+            
+            if inorder_match:
+                inorder_body = inorder_match.group(1)
+                append_pos = inorder_body.find("append") if "append" in inorder_body else -1
+                left_call = inorder_body.find(".left") if ".left" in inorder_body else -1
+                right_call = inorder_body.find(".right") if ".right" in inorder_body else -1
+                
+                if left_call > 0 and append_pos > 0 and append_pos < left_call:
+                    inorder_bugs.append("Appending BEFORE left traversal (should be after)")
+                if append_pos > 0 and right_call > 0 and append_pos > right_call:
+                    inorder_bugs.append("Appending AFTER right traversal (should be before)")
+        
+        # Postorder should be: left -> right -> root
+        if "def postorder" in code.lower():
+            postorder_pattern = r'def postorder.*?:\s*\n(.*?)(?=\ndef|\nclass|\Z)'
+            postorder_match = re.search(postorder_pattern, code, re.DOTALL | re.IGNORECASE)
+            
+            if postorder_match:
+                postorder_body = postorder_match.group(1)
+                append_pos = postorder_body.find("append") if "append" in postorder_body else -1
+                left_call = postorder_body.find(".left") if ".left" in postorder_body else -1
+                right_call = postorder_body.find(".right") if ".right" in postorder_body else -1
+                
+                if append_pos > 0 and left_call > 0 and append_pos < left_call:
+                    postorder_bugs.append("Appending happens BEFORE traversals (should be after)")
+                if append_pos > 0 and right_call > 0 and append_pos < right_call:
+                    postorder_bugs.append("Appending happens BEFORE right traversal (should be after)")
+        
+        # ===== OUTPUT VALIDATION =====
+        if stdout and "[" in stdout:
+            try:
+                list_pattern = r'\[(.*?)\]'
+                matches = re.findall(list_pattern, stdout)
+                if matches:
+                    output_str = matches[-1]
+                    output_list = [int(x.strip()) for x in output_str.split(',') if x.strip().isdigit()]
+                    if output_list:
+                        if "def preorder" in code.lower():
+                            if output_list == [2, 1, 3]:
+                                preorder_bugs.append(f"Output {output_list} is INORDER not PREORDER")
+                        if "def inorder" in code.lower():
+                            if output_list == [1, 2, 3]:
+                                inorder_bugs.append(f"Output {output_list} is PREORDER not INORDER")
+                        if "def postorder" in code.lower():
+                            if output_list == [1, 2, 3] or output_list == [2, 1, 3]:
+                                postorder_bugs.append(f"Output {output_list} is not POSTORDER")
+            except:
+                pass
+        
+        # Combine all detected bugs
+        all_bugs = preorder_bugs + inorder_bugs + postorder_bugs
+        
+        if all_bugs:
+            bug_message = " | ".join(all_bugs)
+            traversal_type = "Preorder" if preorder_bugs else ("Inorder" if inorder_bugs else "Postorder")
+            
+            return FileError(
+                file_path="code.py",
+                line_number=None,
+                error_type="LogicError",
+                error_message=f"Tree {traversal_type} Traversal Bug: {bug_message}",
+                error_category=ErrorCategory.AUTO_FIXABLE,
+                severity="error"
+            )
+        
+        return None
+    
+    @staticmethod
+    def detect_memoization_bugs(code: str, stdout: str) -> Optional[FileError]:
+        """Detect memoization and recursion logic errors (e.g., Fibonacci memo bugs)"""
+        
+        # Check if this is recursion/memoization code
+        if "memo" not in code.lower() and "cache" not in code.lower():
+            return None
+        
+        if "def" not in code:
+            return None
+        
+        memoization_bugs = []
+        
+        # Fibonacci memoization bug: memo[0] instead of memo[n]
+        if "fib" in code.lower():
+            # Check for memo[0] lookup bugs
+            if "memo[0]" in code and "if n in memo" in code:
+                memoization_bugs.append("Fibonacci memo bug: accessing memo[0] instead of memo[n]")
+                memoization_bugs.append("This causes incorrect cached values to be returned")
+            
+            # Check if memo is being initialized properly
+            if "memo={}" in code or "memo = {}" in code:
+                # Mutable default argument - potential bug
+                memoization_bugs.append("Mutable default argument memo={} can cause state persistence issues")
+            
+            # Check expected output vs actual
+            if stdout:
+                try:
+                    output = stdout.strip()
+                    if output.isdigit():
+                        result = int(output)
+                        # fib(10) should be 55
+                        if "fib(10)" in code and result != 55:
+                            memoization_bugs.append(f"Expected fib(10)=55 but got {result} - memo lookup is wrong")
+                except:
+                    pass
+        
+        # Generic recursion depth or memo key issues
+        if "memo[" in code:
+            # Look for potential wrong key access patterns
+            if re.search(r'memo\[\d+\]', code):  # memo[0], memo[1], etc. as hardcoded indices
+                # Check if these are always the same, suggesting a bug
+                hardcoded_keys = re.findall(r'memo\[(\d+)\]', code)
+                if hardcoded_keys and len(set(hardcoded_keys)) == 1:
+                    memoization_bugs.append(f"Using hardcoded memo key [{hardcoded_keys[0]}] instead of dynamic key")
+        
+        if memoization_bugs:
+            bug_message = " | ".join(memoization_bugs)
+            return FileError(
+                file_path="code.py",
+                line_number=None,
+                error_type="LogicError",
+                error_message=f"Memoization/Recursion Bug: {bug_message}",
+                error_category=ErrorCategory.AUTO_FIXABLE,
+                severity="error"
+            )
+        
+        return None
+
 analyzer = ErrorAnalyzer()
 
 # =============================================================================
@@ -489,6 +779,53 @@ Given the original code and an error, provide the complete corrected code.
 Be precise and only fix the specific error mentioned. Keep all other code unchanged.
 Respond ONLY with the corrected code, no explanations."""
 
+        # Build context-specific guidance
+        error_context = ""
+        
+        if "Tree" in error.error_type or "Traversal" in error.error_message:
+            error_context = """
+## TREE TRAVERSAL FIX GUIDE:
+
+Preorder (Root-Left-Right):
+  1. Process the root node FIRST
+  2. Then recursively traverse left subtree
+  3. Then recursively traverse right subtree
+  DO: res.append(root.val) BEFORE recursive calls
+
+Inorder (Left-Root-Right):
+  1. Recursively traverse left subtree FIRST
+  2. Then process root node
+  3. Then recursively traverse right subtree
+  DO: res.append(root.val) BETWEEN left and right recursive calls
+
+Postorder (Left-Right-Root):
+  1. Recursively traverse left subtree FIRST
+  2. Then recursively traverse right subtree
+  3. Then process root node LAST
+  DO: res.append(root.val) AFTER both recursive calls
+"""
+        
+        elif "Memoization" in error.error_type or "memo" in error.error_message.lower():
+            error_context = """
+## MEMOIZATION/RECURSION FIX GUIDE:
+
+Common Bugs:
+  1. Using wrong memo key: memo[0] instead of memo[n] - WRONG
+     FIX: Use the current function parameter as key: memo[n]
+  
+  2. Mutable default argument: def fib(n, memo={}) - DANGEROUS
+     FIX: Use None and create fresh dict: def fib(n, memo=None) then if memo is None: memo={}
+  
+  3. Check memo BEFORE recursive call:
+     if n in memo:
+         return memo[n]  # Use correct key!
+     memo[n] = fib(...) + fib(...)
+     return memo[n]
+
+  4. For Fibonacci specifically: fib(10) should return 55
+     Make sure memo lookup uses the parameter, not hardcoded values
+"""
+        
         user_prompt = f"""Original Code:
 ```{language}
 {code}
@@ -497,6 +834,7 @@ Respond ONLY with the corrected code, no explanations."""
 Error Type: {error.error_type}
 Error Message: {error.error_message}
 {f"Line Number: {error.line_number}" if error.line_number else ""}
+{error_context}
 
 Provide the complete corrected code that fixes this error:"""
 
@@ -529,8 +867,71 @@ Provide the complete corrected code that fixes this error:"""
             )
             
         except Exception as e:
-            print(f"Error generating patch: {e}")
+            print(f"Error generating patch with LLM: {e}")
+            # Fallback: Try heuristic fixes for known patterns
+            corrected_code = self._apply_heuristic_fix(code, error, language)
+            if corrected_code and corrected_code != code:
+                print(f"Applying heuristic fix for {error.error_type}")
+                diff = self._generate_diff(code, corrected_code)
+                unified = self._generate_unified_diff(code, corrected_code, file_path=error.file_path)
+                line_edits = self._compute_line_edits(code, corrected_code)
+                structured = self._create_structured_suggestions(line_edits, code, corrected_code)
+                
+                return FilePatch(
+                    file_path=error.file_path,
+                    original_content=code,
+                    patched_content=corrected_code,
+                    diff=diff,
+                    unified_diff=unified,
+                    line_edits=line_edits,
+                    structured_fixes=structured,
+                    error_fixed=f"{error.error_type}: {error.error_message}",
+                    fix_explanation="Heuristic fix applied (LLM unavailable)",
+                    confidence=0.6
+                )
             return None
+    
+    def _apply_heuristic_fix(self, code: str, error: FileError, language: str) -> Optional[str]:
+        """Apply heuristic fixes for known bug patterns when LLM is unavailable"""
+        
+        if language != "python":
+            return None
+        
+        error_msg = error.error_message.lower()
+        
+        # Preorder traversal fix
+        if "preorder" in error_msg and "traversal" in error_msg:
+            # Move append before recursive calls
+            fixed = re.sub(
+                r'(def preorder\([^)]+\):[\s\S]*?if not root:\s*return\s*\n)(\s*)preorder\(',
+                r'\1\2res.append(root.val)\n\2preorder(',
+                code,
+                count=1
+            )
+            if "res.append(root.val)" not in fixed.split("preorder(root.left")[0]:
+                # Fallback: manual string replacement
+                fixed = code.replace(
+                    "preorder(root.left, res)\n    res.append(root.val)\n    preorder(root.right, res)",
+                    "res.append(root.val)\n    preorder(root.left, res)\n    preorder(root.right, res)"
+                )
+            return fixed if fixed != code else None
+        
+        # Fibonacci memoization fix
+        if "fibonacci" in error_msg.lower() or "memo" in error_msg.lower():
+            # Replace memo[0] with memo[n]
+            fixed = code.replace("memo[0]", "memo[n]")
+            # Also fix mutable default argument
+            fixed = fixed.replace("def fib(n, memo={}):", "def fib(n, memo=None):")
+            if "memo is None:" not in fixed:
+                # Add memo initialization
+                fixed = re.sub(
+                    r'(def fib\(n, memo=None\):[\s\S]*?\n)(\s+if n)',
+                    r'\1\2    if memo is None:\n\2        memo = {}\n\2if n',
+                    fixed
+                )
+            return fixed if fixed != code else None
+        
+        return None
     
     async def _generate_explanation(
         self, 
@@ -706,13 +1107,28 @@ class ContinuousCodeFixer:
                 {"exit_code": exec_result.exit_code, "execution_time": exec_result.execution_time}
             )
             
-            # If execution succeeded, we're done
-            if exec_result.success:
+            # Parse errors from stderr
+            errors = analyzer.parse_errors(exec_result.stderr, language)
+            
+            # ALWAYS check for logic errors even if execution succeeded (exit_code=0)
+            # Logic errors produce wrong output but don't crash the program
+            if language == "python":
+                traversal_error = analyzer.detect_tree_traversal_bugs(current_code, exec_result.stdout)
+                if traversal_error and not any(e.error_type == "LogicError" for e in errors):
+                    errors.insert(0, traversal_error)
+                
+                # Also detect memoization/recursion bugs
+                memo_error = analyzer.detect_memoization_bugs(current_code, exec_result.stdout)
+                if memo_error and not any(e.error_type == "LogicError" for e in errors):
+                    errors.insert(0, memo_error)
+            
+            # If execution succeeded AND no logic errors detected, we're done
+            if exec_result.success and not errors:
                 add_log("success", "✅ Code is now fixed! All iterations passed.", {})
                 return current_code, logs, all_patches
             
-            # Parse errors
-            errors = analyzer.parse_errors(exec_result.stderr, language)
+            # If there are errors (including logic errors), attempt to fix them
+            
             add_log("warning", f"Found {len(errors)} error(s)", {"errors": [e.dict() for e in errors]})
             
             # Check if errors are auto-fixable
@@ -776,6 +1192,24 @@ async def health_check():
         "message": "Ollama is required for AI features" if not ollama_status else "All systems operational"
     }
 
+@app.post("/api/execute")
+async def execute_code(request: AnalysisRequest):
+    """Execute code and return output (simple execution without analysis)"""
+    # Execute code in sandbox
+    execution_result = await sandbox.execute_code(
+        request.code,
+        request.language,
+        request.file_path
+    )
+    
+    return {
+        "success": execution_result.success,
+        "stdout": execution_result.stdout,
+        "stderr": execution_result.stderr,
+        "exit_code": execution_result.exit_code,
+        "execution_time": execution_result.execution_time
+    }
+
 @app.post("/api/analyze", response_model=AnalysisResponse)
 async def analyze_code(request: AnalysisRequest):
     """Analyze code, execute it, detect errors, and generate patches"""
@@ -801,6 +1235,17 @@ async def analyze_code(request: AnalysisRequest):
     errors = []
     if not execution_result.success:
         errors = analyzer.parse_errors(execution_result.stderr, request.language)
+    
+    # Also detect tree traversal logic errors (even if execution succeeded)
+    if request.language == "python":
+        traversal_error = analyzer.detect_tree_traversal_bugs(request.code, execution_result.stdout)
+        if traversal_error and not any(e.error_type == "LogicError" for e in errors):
+            errors.insert(0, traversal_error)
+        
+        # Also detect memoization/recursion bugs
+        memo_error = analyzer.detect_memoization_bugs(request.code, execution_result.stdout)
+        if memo_error and not any(e.error_type == "LogicError" for e in errors):
+            errors.insert(0, memo_error)
     
     # Generate patches using AI
     analysis, patches = await ai_fixer.analyze_and_fix(
@@ -852,10 +1297,20 @@ async def analyze_code_stream(request: AnalysisRequest):
         errors = []
         if not execution_result.success:
             errors = analyzer.parse_errors(execution_result.stderr, request.language)
+        
+        # Also detect tree traversal logic errors
+        if request.language == "python":
+            traversal_error = analyzer.detect_tree_traversal_bugs(request.code, execution_result.stdout)
+            if traversal_error and not any(e.error_type == "LogicError" for e in errors):
+                errors.insert(0, traversal_error)
+            
+            # Also detect memoization/recursion bugs
+            memo_error = analyzer.detect_memoization_bugs(request.code, execution_result.stdout)
+            if memo_error and not any(e.error_type == "LogicError" for e in errors):
+                errors.insert(0, memo_error)
+        
+        if errors:
             yield (json.dumps({"event": "errors_parsed", "data": [e.dict() for e in errors]}) + "\n")
-
-        # If no errors, continue but report and finish
-        if not errors:
             analysis = "No errors detected. Code executed successfully!"
             patches = []
             session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
