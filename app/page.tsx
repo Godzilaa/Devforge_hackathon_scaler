@@ -109,33 +109,6 @@ const sum = numbers.reduce((acc, n) => acc + n, 0);
 console.log("Sum:", sum);`
       }
     ]
-  },
-  {
-    id: 'README.md',
-    name: 'README.md',
-    type: 'file',
-    language: 'markdown',
-    content: `# CodeIDE - Web-based Development Environment
-
-🚀 **Welcome to CodeIDE!**
-
-## Features
-
-- 📝 Monaco Editor (VS Code engine)
-- 📁 File Explorer with create/delete
-- 🎨 Syntax Highlighting
-- 💾 Auto-save
-- 🌙 Dark Theme
-- ⚡ Fast Performance
-
-## Getting Started
-
-1. Use the file explorer to navigate files
-2. Click (+) buttons to add new files/folders
-3. Start coding!
-4. Use the run button to execute code
-
-**Happy Coding!** 🎉`
   }
 ];
 
